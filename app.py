@@ -1,30 +1,11 @@
-import os
+import os, json
 import numpy as np, pandas as pd
 import plotly.express as px, plotly.graph_objects as go
 import streamlit as st
+from analytics import GROUPS, RATES, derived, zscore_1y, pca_input, run_pca, pc1_share
 
 st.set_page_config(page_title="Market Dashboard", page_icon="📈", layout="wide")
-CSV = "data/daily_update.csv"
-
-GROUPS = {
- "Equities": ["S&P 500","Nasdaq-100","Dow Jones","Russell 2000","STOXX Europe 600","DAX","FTSE 100",
-              "CAC 40","Nikkei 225","Hang Seng","CSI 300","Shanghai Composite","KOSPI","Nifty 50",
-              "MSCI World (proxy URTH)","MSCI EM (proxy EEM)"],
- "Bonds (ETFs)": ["US Aggregate (AGG)","Global Agg ex-US (BNDX)","US Treasury 7-10Y (IEF)",
-              "US Treasury 20Y+ (TLT)","US Investment Grade (LQD)","US High Yield (HYG)",
-              "EM USD Bonds (EMB)","EM Local Bonds (EMLC)"],
- "Metals": ["Gold","Silver","Platinum","Palladium","Copper","Aluminum","Iron Ore"],
- "Energy": ["WTI Crude","Brent Crude","Henry Hub Nat Gas","TTF Europe Nat Gas","Gasoline (RBOB)",
-            "Heating Oil / Diesel","Uranium"],
- "Agriculture": ["Corn","Wheat","Soybeans","Rice","Sugar","Coffee","Cocoa","Cotton","Orange Juice",
-                 "Live Cattle","Lean Hogs","Soybean Oil","Soybean Meal"],
- "FX": ["EURUSD","GBPUSD","AUDUSD","NZDUSD","USDJPY","USDCHF","USDCAD","USDCNY","USDHKD","USDSGD",
-        "EURGBP","EURJPY","GBPJPY","AUDJPY","EURCHF"],
- "Rates (%)": ["Fed Funds","ECB Deposit Rate","BoJ Policy Rate","SOFR","US 2Y Treasury",
-               "US 10Y Treasury","US 30Y Treasury","German Bund 10Y","JGB 10Y","UK Gilt 10Y",
-               "US 10Y-2Y Spread"],
-}
-RATES = set(GROUPS["Rates (%)"])
+CSV, INS = "data/daily_update.csv", "data/insights.json"
 YRS = {"1M":1/12,"3M":0.25,"6M":0.5,"1Y":1,"2Y":2,"3Y":3,"5Y":5,"10Y":10,"20Y":20}
 
 
@@ -34,72 +15,39 @@ def load(mtime):
     return df.dropna(axis=1, how="all")
 
 
-def derived(df):
-    d = pd.DataFrame(index=df.index)
-    def r(a, b, name):
-        if a in df and b in df: d[name] = df[a] / df[b]
-    def s(a, b, name):
-        if a in df and b in df: d[name] = df[a] - df[b]
-    r("Gold","Silver","Gold/Silver"); r("Copper","Gold","Copper/Gold")
-    r("Gold","WTI Crude","Gold/Oil"); r("S&P 500","Gold","S&P/Gold")
-    r("Nasdaq-100","S&P 500","Nasdaq/S&P"); r("Russell 2000","S&P 500","Small/Large cap")
-    r("MSCI EM (proxy EEM)","MSCI World (proxy URTH)","EM/World")
-    r("US High Yield (HYG)","US Treasury 7-10Y (IEF)","HY/Treasury (risk appetite)")
-    r("Soybeans","Corn","Soybean/Corn"); r("Platinum","Gold","Platinum/Gold")
-    s("Brent Crude","WTI Crude","Brent-WTI"); s("US 30Y Treasury","US 2Y Treasury","US 30Y-2Y")
-    s("US 10Y Treasury","German Bund 10Y","US-Bund 10Y"); s("US 10Y Treasury","JGB 10Y","US-JGB 10Y")
-    s("US 2Y Treasury","Fed Funds","US 2Y-Fed Funds")
-    if all(c in df for c in ["Soybeans","Soybean Oil","Soybean Meal"]):   # crush: $/bu
-        d["Soy crush"] = df["Soybean Meal"]*0.022 + df["Soybean Oil"]*0.11 - df["Soybeans"]/100
-    return d
-
-
-def pca_input(df, mode, log_lv):
-    """Returns DataFrame of PCA inputs (not yet standardized)."""
-    pcols = [c for c in df if c not in RATES]
-    rcols = [c for c in df if c in RATES]
-    if mode == "Daily returns":
-        X = pd.concat([df[pcols].pct_change(fill_method=None), df[rcols].diff() / 100], axis=1)
-    else:
-        lv = df[pcols].where(df[pcols] > 0)
-        X = pd.concat([np.log(lv) if log_lv else lv, df[rcols]], axis=1)
-    return X.iloc[1:]
-
-
-def run_pca(X, min_cov=0.9):
-    """Standardize within the window and do PCA. Drops columns with poor coverage."""
-    X = X.dropna(axis=1, thresh=int(len(X) * min_cov)).ffill().bfill()
-    sd = X.std().replace(0, np.nan)
-    Z = ((X - X.mean()) / sd).dropna(axis=1)
-    vals, vecs = np.linalg.eigh(np.cov(Z.T))
-    o = vals.argsort()[::-1]
-    vals, vecs = vals[o], vecs[:, o]
-    if "S&P 500" in Z:                                  # sign convention: S&P loads positive
-        sgn = np.sign(vecs[list(Z.columns).index("S&P 500")]); sgn[sgn == 0] = 1
-        vecs = vecs * sgn
-    return Z, vals / vals.sum(), pd.DataFrame(vecs, index=Z.columns,
-                                              columns=[f"PC{i+1}" for i in range(len(vals))])
+@st.cache_data(ttl=3600)
+def load_insights(mtime):
+    try: return json.load(open(INS, encoding="utf-8"))
+    except Exception: return {}
 
 
 @st.cache_data(ttl=3600, show_spinner="Computing rolling PCA…")
 def rolling_pc1(mtime, mode, log_lv, win, step):
     X = pca_input(load(mtime), mode, log_lv)
     X = X.dropna(axis=1, thresh=int(len(X) * 0.5))
-    out = {}
-    for t in range(win, len(X), step):
-        w = X.iloc[t - win:t]
-        w = w.dropna(axis=1, thresh=int(win * 0.9)).ffill().bfill()
-        w = ((w - w.mean()) / w.std().replace(0, np.nan)).dropna(axis=1)
-        if w.shape[1] < 5: continue
-        e = np.linalg.eigvalsh(np.cov(w.T))
-        out[X.index[t]] = e.max() / e.sum()
-    return pd.Series(out)
+    return pd.Series({X.index[t-1]: pc1_share(X, t, win) for t in range(win, len(X)+1, step)}).dropna()
+
+
+def ai_box(key, title, note=""):
+    txt = ins.get(key)
+    with st.container(border=True):
+        st.markdown(f"#### 🤖 {title}")
+        if not txt:
+            st.info("No AI insight yet – it is generated by the daily GitHub job.")
+            return
+        meta = f"Generated {ins.get('generated_utc','')[:16].replace('T',' ')} UTC · data to {ins.get('data_date','')}" \
+               f" · {ins.get('model','')}"
+        if ins.get(f"{key}_stale"): meta += " · ⚠️ today's run failed, showing previous insight"
+        st.caption(meta + (f" · {note}" if note else ""))
+        st.markdown(txt)
+        st.caption("AI-generated from the dashboard statistics; may contain errors. Not investment advice.")
 
 
 if not os.path.exists(CSV):
     st.error("No data yet - run the GitHub Action once."); st.stop()
 mtime = os.path.getmtime(CSV)
 df = load(mtime)
+ins = load_insights(os.path.getmtime(INS) if os.path.exists(INS) else 0)
 last = df.index.max()
 
 # ---------- sidebar ----------
@@ -115,6 +63,14 @@ tabs = st.tabs(["Overview","Charts","Ratios & Spreads","Rates","Correlation","PC
 
 # ---------- Overview ----------
 with tabs[0]:
+    ai_box("news", "Critical events & news", "summarised from recent headlines")
+    hl = ins.get("headlines", [])
+    if hl:
+        with st.expander(f"📰 Latest headlines ({len(hl)})"):
+            for h in hl:
+                t = (h.get("time") or "")[:16].replace("T", " ")
+                st.markdown(f"- [{h['title']}]({h['link']}) · *{h['source']}* · {t}")
+
     def back(days): return df[df.index <= last - pd.Timedelta(days=days)].iloc[-1]
     cur = df.iloc[-1]
     ytd0 = df[df.index < pd.Timestamp(last.year, 1, 1)]
@@ -126,6 +82,7 @@ with tabs[0]:
             rows.append([g, c, cur[c], f(df[c].iloc[-2]), f(back(7)[c]), f(back(30)[c]),
                          f(ytd0[c]), f(back(365)[c])])
     tbl = pd.DataFrame(rows, columns=["Group","Asset","Last","1D","1W","1M","YTD","1Y"])
+    st.markdown("#### Market moves")
     st.caption("% change for prices; absolute change (percentage points) for rates")
     grp = st.selectbox("Group", ["All"] + list(GROUPS))
     t = tbl if grp == "All" else tbl[tbl.Group == grp]
@@ -155,10 +112,12 @@ with tabs[1]:
 
 # ---------- Ratios ----------
 with tabs[2]:
+    ai_box("ratios", "AI insight – ratios & spreads")
     d = derived(df)
+    zall = zscore_1y(d)
     pick = st.selectbox("Ratio / spread", list(d.columns))
     s = d[pick][d.index >= start].dropna()
-    z = (d[pick] - d[pick].rolling(252).mean()) / d[pick].rolling(252).std()
+    z = zall[pick]
     if len(s):
         c1, c2, c3 = st.columns(3)
         c1.metric(pick, f"{s.iloc[-1]:,.4g}", f"{s.iloc[-1]-s.iloc[0]:+.4g} over period")
@@ -167,7 +126,7 @@ with tabs[2]:
         c3.metric("Percentile (full history)", f"{(full < full.iloc[-1]).mean()*100:.0f}%")
         fig = px.line(s, height=420); fig.add_hline(s.mean(), line_dash="dot")
         st.plotly_chart(fig, width="stretch")
-    zt = ((d - d.rolling(252).mean()) / d.rolling(252).std()).iloc[-1].sort_values()
+    zt = zall.iloc[-1].sort_values()
     st.plotly_chart(px.bar(zt, orientation="h", title="All ratios: 1Y z-score (extremes = stretched)",
                     height=550), width="stretch")
 
@@ -205,6 +164,7 @@ with tabs[4]:
 
 # ---------- PCA ----------
 with tabs[5]:
+    ai_box("pca", "AI insight – PCA / regime", "based on 1-year window, returns and levels PCA")
     c1, c2 = st.columns(2)
     pmode = c1.radio("PCA input", ["Daily returns", "Levels (standardized)"], horizontal=True)
     log_lv = c2.checkbox("Use log prices for levels", value=True,
@@ -243,8 +203,7 @@ with tabs[5]:
 
     scores = pd.DataFrame(Z.values @ L.iloc[:, :3].values, index=Z.index, columns=["PC1","PC2","PC3"])
     if pmode == "Daily returns":
-        scores = scores.cumsum()
-        ttl = "Cumulative PC factor returns (PC1–3)"
+        scores = scores.cumsum(); ttl = "Cumulative PC factor returns (PC1–3)"
     else:
         ttl = "PC scores over time (PC1–3) — where the market sits in each factor"
     st.plotly_chart(px.line(scores, title=ttl, height=400), width="stretch")
