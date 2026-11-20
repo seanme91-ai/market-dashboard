@@ -1,13 +1,14 @@
 """
 update_data.py  -  builds / updates data/daily_update.csv (+ .xlsx copy)
-First run  : back-fills HISTORY_YEARS of history.
+First run  : back-fills HISTORY_YEARS of history (also re-runs automatically
+             if the saved file starts later than HISTORY_YEARS ago).
 Later runs : re-downloads the last 15 days and overwrites/extends those rows,
              so missed days and late revisions are fixed automatically.
 """
 import io, os, datetime as dt
 import pandas as pd, requests, yfinance as yf
 
-HISTORY_YEARS = 5
+HISTORY_YEARS = 20
 CSV  = "data/daily_update.csv"
 XLSX = "data/Daily Update.xlsx"
 
@@ -66,12 +67,16 @@ def get_fred(sid, start):
 def main():
     os.makedirs("data", exist_ok=True)
     old = pd.read_csv(CSV, parse_dates=["Date"], index_col="Date") if os.path.exists(CSV) else None
-    start = (dt.date.today() - dt.timedelta(days=15 if old is not None and len(old) else 365 * HISTORY_YEARS))
+    full_start = dt.date.today() - dt.timedelta(days=round(365.25 * HISTORY_YEARS))
+    # full back-fill if no file yet, or the file doesn't reach back far enough
+    if old is None or old.empty or old.index.min() > pd.Timestamp(full_start) + pd.Timedelta(days=30):
+        start, old = full_start, None
+    else:
+        start = dt.date.today() - dt.timedelta(days=15)
     print("Downloading from", start)
 
     new = get_yahoo(start)
-    # keep only weekdays (FX trades Sun-evening etc.)
-    new = new[new.index.dayofweek < 5]
+    new = new[new.index.dayofweek < 5]                  # weekdays only
     for col, sid in FRED.items():
         s = get_fred(sid, start)
         new[col] = s.reindex(new.index.union(s.index)).ffill().reindex(new.index)
@@ -88,8 +93,9 @@ def main():
     out = out.round(6)
     out.to_csv(CSV)
     out.to_excel(XLSX, sheet_name="Sheet1")
-    print(f"Saved {len(out)} rows, last date {out.index.max().date()}")
-    print("Empty columns today:", [c for c in COLUMNS if pd.isna(out[c].iloc[-1])])
+    print(f"Saved {len(out)} rows, {out.index.min().date()} to {out.index.max().date()}")
+    print("First available date per column:")
+    print(out.apply(lambda c: c.first_valid_index()).dt.date.to_string())
 
 
 if __name__ == "__main__":
